@@ -1,0 +1,38 @@
+# Extracted datasets (too large for git)
+datasets/raw/
+datasets/aligned/
+datasets/manifest.json
+
+# Model weights and caches
+models/train_embeddings.npz
+models/adapter_best.pt
+models/adapter_final.pt
+models/gallery.npz
+
+# Reports (generated outputs)
+reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtual environments
+faceenv/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+*.tmp

@@ -121,36 +121,46 @@ with open(MANIFEST) as fh:
     manifest = json.load(fh)
 test_items = [m for m in manifest if m['split'] == 'test']
 
-results = []   # list of dicts per test image
+# Cache the raw backbone embeddings (the slow DeepFace/TF pass). Matching against
+# the gallery is fast and recomputed each run, so the cache stays valid even if
+# the adapter or gallery change. Delete test_embeddings.npz to force a re-extract.
+TEST_EMB_CACHE = MODEL_DIR / "test_embeddings.npz"
 
-for i, item in enumerate(test_items):
-    p = Path(item['path'])
-    if not p.exists():
-        continue
+if TEST_EMB_CACHE.exists():
+    print("  [SKIP] Loading cached test embeddings …")
+    d        = np.load(TEST_EMB_CACHE, allow_pickle=True)
+    test_raw = d['X']
+    test_ids = list(d['ids'])
+else:
+    raw_list, id_list = [], []
+    for i, item in enumerate(test_items):
+        p = Path(item['path'])
+        if not p.exists():
+            continue
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+        raw_list.append(get_raw_embedding(img))
+        id_list.append(item['identity'])
+        if (i + 1) % 50 == 0:
+            print(f"  {i+1}/{len(test_items)} …")
+    test_raw = np.array(raw_list, dtype=np.float32)
+    test_ids = id_list
+    np.savez(TEST_EMB_CACHE, X=test_raw, ids=np.array(test_ids))
 
-    img = cv2.imread(str(p))
-    if img is None:
-        continue
-
-    raw = get_raw_embedding(img)
-
-    # Adapted match
-    proj  = adapt_batch(raw[np.newaxis])[0]
+# Match every test embedding against the gallery (fast).
+proj_all = adapt_batch(test_raw)            # (N, EMBED_DIM)
+results = []
+for raw, proj, true_id in zip(test_raw, proj_all, test_ids):
     name_a, sim_a = match_adapted(proj)
-
-    # Raw match (baseline)
     name_r, sim_r = match_raw(raw)
-
     results.append({
-        'true_id'    : item['identity'],
+        'true_id'    : true_id,
         'pred_adapted': name_a,
         'sim_adapted' : sim_a,
         'pred_raw'    : name_r,
         'sim_raw'     : sim_r,
     })
-
-    if (i + 1) % 50 == 0:
-        print(f"  {i+1}/{len(test_items)} …")
 
 print(f"[INFO] {len(results)} test images processed\n")
 
@@ -237,7 +247,7 @@ def pr_auc(rows):
     pairs = sorted(zip(rs, ps))
     rs_s  = [p[0] for p in pairs]
     ps_s  = [p[1] for p in pairs]
-    return float(np.trapz(ps_s, rs_s))
+    return float(np.trapezoid(ps_s, rs_s))
 
 auc_a = pr_auc(rows_adapted)
 auc_r = pr_auc(rows_raw)
@@ -305,7 +315,7 @@ for i, idn in enumerate(ids):
 report_text = "\n".join(lines)
 print(report_text)
 
-with open(report_path, 'w') as fh:
+with open(report_path, 'w', encoding='utf-8') as fh:
     fh.write(report_text)
 print(f"\n[SAVED] {report_path}")
 

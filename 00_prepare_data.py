@@ -30,8 +30,8 @@ DATASET_TV = BASE / "train_val" / "datasets"
 RAW_DIR    = DATASET_TV / "raw"
 ALIGNED_DIR= DATASET_TV / "aligned"
 
-DNHFACES_ZIP = Path(r"C:\Users\Netrin\Downloads\References\Dataset and papers\DnHFaces.zip")
-DATA2_ZIP    = Path(r"C:\Users\Netrin\Downloads\Data2-20260618T122935Z-3-001.zip")
+DNHFACES_ZIP = Path(__file__).parent / "DnHFaces.zip"
+DATA2_ZIP    = Path(__file__).parent / "Data2-20260618T122935Z-3-001.zip"
 
 VALID_EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG'}
 
@@ -53,14 +53,31 @@ def align_largest_face(img):
     face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
     return face_align.norm_crop(img, face.kps)
 
-def save_aligned(img_path: Path, out_path: Path):
-    """Load → align → save. Returns True on success."""
+def save_aligned(img_path: Path, out_path: Path, resize_fallback: bool = False):
+    """Load → SCRFD align → save. For pre-cropped far-face thumbnails too tight
+    for SCRFD to detect, resize_fallback=True resizes the whole crop to 112×112
+    instead of dropping it. Returns 'aligned' | 'resized' | False."""
     img = cv2.imread(str(img_path))
     if img is None:
         return False
     aligned = align_largest_face(img)
+    status = 'aligned'
     if aligned is None:
+        if not resize_fallback:
+            return False
+        aligned = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LANCZOS4)
+        status = 'resized'
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), aligned)
+    return status
+
+def save_resized(img_path: Path, out_path: Path):
+    """For already-cropped faces (Data2 drone thumbnails): straight resize to
+    112×112, no detection. Returns True on success."""
+    img = cv2.imread(str(img_path))
+    if img is None:
         return False
+    aligned = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LANCZOS4)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_path), aligned)
     return True
@@ -89,40 +106,47 @@ print("=" * 60)
 # gp_0 → train;  gp_3/4/5 → test
 TRAIN_GROUPS = {'0'}
 
-photos_dir = RAW_DIR / "DnHFaces" / "open_data_set" / "photos_all"
+# Use photos_all_faces → per-individual crops (a–k = 11 identities), correctly
+# labelled. photos_all holds multi-person group shots (wrong labels), so we
+# deliberately use the pre-extracted single-person crops here.
+photos_dir = RAW_DIR / "DnHFaces" / "open_data_set" / "photos_all_faces"
 if not photos_dir.exists():
     # Try finding it
-    candidates = list((RAW_DIR / "DnHFaces").rglob("photos_all"))
+    candidates = list((RAW_DIR / "DnHFaces").rglob("photos_all_faces"))
     photos_dir = candidates[0] if candidates else photos_dir
 
-stats_dnh = {'ok': 0, 'no_face': 0, 'err': 0}
+stats_dnh = {'aligned': 0, 'resized': 0, 'no_face': 0}
 
 for img_file in photos_dir.iterdir():
     if img_file.suffix not in VALID_EXT:
         continue
 
-    name = img_file.stem          # e.g. ab_gp_3_eo_05
+    name = img_file.stem          # e.g. a_gp_0_ef_00
     parts = name.split('_')
     if len(parts) < 3 or parts[1] != 'gp':
         continue
 
-    identity  = parts[0]          # e.g. "ab"
-    group_num = parts[2]          # e.g. "3"
+    identity  = parts[0]          # single person: "a".."k"
+    group_num = parts[2]          # "0" → train, "3/4/5" → test
     split     = 'train' if group_num in TRAIN_GROUPS else 'test'
 
     out_path = ALIGNED_DIR / f"DnH_{identity}" / split / img_file.name
 
     if out_path.exists():
-        stats_dnh['ok'] += 1
+        stats_dnh['aligned'] += 1
         continue
 
-    ok = save_aligned(img_file, out_path)
-    if ok:
-        stats_dnh['ok'] += 1
+    # Far-face thumbnails: align if SCRFD finds a face, else resize the crop.
+    status = save_aligned(img_file, out_path, resize_fallback=True)
+    if status == 'aligned':
+        stats_dnh['aligned'] += 1
+    elif status == 'resized':
+        stats_dnh['resized'] += 1
     else:
         stats_dnh['no_face'] += 1
 
-print(f"  DnHFaces: {stats_dnh['ok']} aligned, {stats_dnh['no_face']} no-face")
+print(f"  DnHFaces: {stats_dnh['aligned']} aligned, "
+      f"{stats_dnh['resized']} resized, {stats_dnh['no_face']} failed")
 
 # ── Process Data2 ─────────────────────────────────────────────────────────────
 print("\n" + "=" * 60)
@@ -156,7 +180,7 @@ for person_dir in data2_root.iterdir():
                 if out_path.exists():
                     stats_d2['ok'] += 1
                     continue
-                ok = save_aligned(img_file, out_path)
+                ok = save_resized(img_file, out_path)
                 stats_d2['ok' if ok else 'no_face'] += 1
     else:
         # Flat dir (Abhinav) → all go to train
@@ -167,10 +191,10 @@ for person_dir in data2_root.iterdir():
             if out_path.exists():
                 stats_d2['ok'] += 1
                 continue
-            ok = save_aligned(img_file, out_path)
+            ok = save_resized(img_file, out_path)
             stats_d2['ok' if ok else 'no_face'] += 1
 
-print(f"  Data2: {stats_d2['ok']} aligned, {stats_d2['no_face']} no-face")
+print(f"  Data2: {stats_d2['ok']} resized, {stats_d2['no_face']} failed")
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print("\n" + "=" * 60)

@@ -4,7 +4,9 @@ Detection (SCRFD) AND embedding (insightface w600k) both run on onnxruntime-GPU.
 Reads from a video file (drone footage) or webcam. No DeepFace / TensorFlow / adapter.
 """
 import os
-os.add_dll_directory(r"C:\dev\face-recognition-pipeline\faceenv\Lib\site-packages\torch\lib")
+_TORCH_LIB = r"C:\dev\face-recognition-pipeline\faceenv\Lib\site-packages\torch\lib"
+os.environ["PATH"] = _TORCH_LIB + os.pathsep + os.environ.get("PATH", "")
+os.add_dll_directory(_TORCH_LIB)
 
 import cv2
 import numpy as np
@@ -14,8 +16,9 @@ import time
 from collections import deque, defaultdict
 
 # ==================== CONFIG ====================
-# Set VIDEO_SOURCE to a file path for drone footage, or 0 for webcam.
-VIDEO_SOURCE = r"C:\Users\hticd\OneDrive\Desktop\DJI data\DJI Avata & Mini 4K\Dark Na,Ab,Si,Ni.mp4"
+# Pass a video path on the command line, else 0 (webcam).
+import sys
+VIDEO_SOURCE = sys.argv[1] if len(sys.argv) > 1 else 0
 
 DETECTOR_NAME = "buffalo_l"                 # w600k_r50 recognizer
 KNOWN_FACES_DIR = r"C:\dev\face-recognition-pipeline\Known_faces"
@@ -29,7 +32,7 @@ MIN_DETECTION_SCORE = 0.15
 
 # Multi-scale detection (ON for far faces; heavier but better range)
 ENABLE_MULTISCALE = True
-SCALES = [0.5,1.0]
+SCALES = [0.5,1.0,2.0]
 
 # Far-face zoom
 ENABLE_FAR_FACE_ZOOM = True
@@ -69,15 +72,30 @@ face_detector = FaceAnalysis(
     allowed_modules=['detection', 'recognition'],   # skip landmark/genderage models (faster)
     providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
 )
-face_detector.prepare(ctx_id=0, det_size=(960, 960))
+face_detector.prepare(ctx_id=0, det_size=(1280, 1280))
 det_model = face_detector.models['detection']
 rec_model = face_detector.models['recognition']
 print("[INFO] Ready\n")
 
+USE_DENOISE = True   # light edge-preserving bilateral denoise before embedding (targets noise, the #1 degrader)
+
 def get_embedding(face112):
     """112x112 BGR aligned crop -> L2-normalized 512-d embedding (GPU)."""
+    if USE_DENOISE:
+        face112 = cv2.bilateralFilter(face112, 5, 50, 50)
     emb = rec_model.get_feat(face112).flatten().astype(np.float32)
     return emb / (np.linalg.norm(emb) + 1e-9)
+
+_clahe_det = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+def enhance_for_detection(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB); l, a, b = cv2.split(lab)
+    img = cv2.cvtColor(cv2.merge([_clahe_det.apply(l), a, b]), cv2.COLOR_LAB2BGR)
+    m = img.mean()
+    if m < 110:
+        g = 1.6 if m < 70 else 1.3
+        lut = np.array([((i/255.0)**(1.0/g))*255 for i in range(256)]).astype('uint8')
+        img = cv2.LUT(img, lut)
+    return img
 
 # ==================== FAR-FACE ZOOM ====================
 class AggressiveFarFaceZoom:
@@ -187,6 +205,8 @@ class FaceTrack:
         self.stable_sim = 0.0
         self.frames_seen = 0
         self.zoom_tier = None
+        self.sum_emb = None      # running sum of raw embeddings (temporal aggregation)
+        self.n_emb = 0
         self.bbox_history = deque(maxlen=5)
         self.bbox_history.append(bbox)
 
@@ -203,20 +223,15 @@ class FaceTrack:
             return True
         return self.bbox_changed_significantly()
 
-    def update_embedding(self, name, similarity, current_frame, zoom_tier=None):
+    def add_embedding(self, emb, current_frame, zoom_tier=None):
+        # temporal aggregation: accumulate raw embeddings over the track's lifetime
         self.last_embed_frame = current_frame
         self.zoom_tier = zoom_tier
-        self.names_history.append(name)
-        self.similarities_history.append(similarity)
-        if len(self.names_history) >= 2:
-            name_scores = defaultdict(float)
-            for i, (n, s) in enumerate(zip(self.names_history, self.similarities_history)):
-                name_scores[n] += s * ((i + 1) / len(self.names_history))
-            self.stable_name = max(name_scores.items(), key=lambda x: x[1])[0]
-            self.stable_sim = float(np.mean(list(self.similarities_history)[-3:]))
-        else:
-            self.stable_name = name
-            self.stable_sim = similarity
+        self.sum_emb = emb.copy() if self.sum_emb is None else self.sum_emb + emb
+        self.n_emb += 1
+
+    def aggregated(self):
+        return self.sum_emb / (np.linalg.norm(self.sum_emb) + 1e-9)
 
     def update_bbox(self, bbox, det_score, frame_num):
         self.bbox = bbox
@@ -326,9 +341,10 @@ while True:
 
     if frame_count % FRAME_SKIP == 0:
         small = cv2.resize(frame, None, fx=DOWNSCALE, fy=DOWNSCALE)
+        small_det = enhance_for_detection(small)   # brighten dark frames for detection only
         all_faces = []
         for scale in (SCALES if ENABLE_MULTISCALE else [1.0]):
-            scaled = small if scale == 1.0 else cv2.resize(small, None, fx=scale, fy=scale)
+            scaled = small_det if scale == 1.0 else cv2.resize(small_det, None, fx=scale, fy=scale)
             try:
                 bboxes, kpss = det_model.detect(scaled, max_num=0, metric='default')
             except Exception:
@@ -386,16 +402,21 @@ while True:
     for track, face112, needs_embed, zoom_info in track_results:
         stats['faces_processed'] += 1
         if needs_embed:
-            name, sim, name2, sim2 = embed_and_match(face112)
+            emb = get_embedding(face112)
             stats['embeddings_generated'] += 1
-            track.update_embedding(name, sim, track_manager.frame_num, zoom_info.get('tier'))
+            track.add_embedding(emb, track_manager.frame_num, zoom_info.get('tier'))
+            # match the TRACK-AGGREGATED embedding (temporal averaging) to the gallery
+            agg = track.aggregated()
+            sims = gallery_embs @ agg
+            order = np.argsort(sims)[::-1]
+            i = int(order[0]); j = int(order[1]) if len(order) > 1 else i
+            track.stable_name = gallery_names[i]; track.stable_sim = float(sims[i])
             x1, y1, x2, y2 = track.bbox
             fs = min(x2 - x1, y2 - y1)
-            decision = name if sim >= SIMILARITY_THRESHOLD else f"Unknown#{track.track_id}"
-            print(f"[REC] f{track_manager.frame_num:<5d} trk{track.track_id:<2d} "
-                  f"{fs:>3d}px {zoom_info.get('tier','none'):<9s} | "
-                  f"best={name:<12s} sim={sim:.3f} | 2nd={name2:<12s} sim={sim2:.3f} | "
-                  f"margin={sim - sim2:+.3f} -> {decision}")
+            decision = track.stable_name if track.stable_sim >= SIMILARITY_THRESHOLD else f"Unknown#{track.track_id}"
+            print(f"[REC] f{track_manager.frame_num:<5d} trk{track.track_id:<2d} {fs:>3d}px "
+                  f"{zoom_info.get('tier','none'):<9s} | agg={track.stable_name:<12s} sim={track.stable_sim:.3f} "
+                  f"(n={track.n_emb}) | 2nd={gallery_names[j]:<10s} {float(sims[j]):.3f} -> {decision}")
         else:
             stats['embeddings_cached'] += 1
 

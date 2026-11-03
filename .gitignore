@@ -39,3 +39,12 @@ tmp/
 
 *.zip
 *.pkl
+*.npz
+
+# Large / private data inside the repo folder
+video_dataset/
+Known_faces/          # real people's photos — remove this line only if the repo is PRIVATE and you intend to publish references
+
+# Generated logs from eval scripts
+*_out.txt
+*_err.txt
